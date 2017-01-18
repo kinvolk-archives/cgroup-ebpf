@@ -24,4 +24,4 @@ int count_packets(struct pt_regs *ctx)
 }
 
 char _license[] SEC("license") = "GPL";
-__u32 _version SEC("version") = 264205;
+__u32 _version SEC("version") = 0xFFFFFFFE;
