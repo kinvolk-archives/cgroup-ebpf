@@ -9,7 +9,7 @@ struct bpf_map_def SEC("maps/count") count_map = {
 	.type = BPF_MAP_TYPE_ARRAY,
 	.key_size = sizeof(int),
 	.value_size = sizeof(__u64),
-	.max_entries = 1024,
+	.max_entries = 4,
 };
 
 SEC("cgroup/skb")
