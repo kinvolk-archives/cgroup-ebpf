@@ -1,5 +1,5 @@
 DEST_DIR=out
-LINUX_HEADERS=$(shell pacman -Q linux-headers | awk '{print "/usr/lib/modules/"$$2"-ARCH/build"}')
+LINUX_HEADERS="/usr/lib/modules/$(shell uname -r)/build"
 
 build:
 	mkdir -p out
