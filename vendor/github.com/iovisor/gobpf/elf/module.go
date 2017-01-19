@@ -30,7 +30,8 @@ import (
 
 /*
 #include <unistd.h>
-#include <linux/bpf.h>
+#include <strings.h>
+#include "include/bpf.h"
 #include <linux/perf_event.h>
 #include <linux/unistd.h>
 
@@ -47,6 +48,19 @@ static int perf_event_open_tracepoint(int tracepoint_id, int pid, int cpu,
 	return syscall(__NR_perf_event_open, &attr, pid, cpu,
                       group_fd, flags);
 }
+
+int bpf_prog_attach(int prog_fd, int target_fd, enum bpf_attach_type type)
+{
+	union bpf_attr attr;
+
+	bzero(&attr, sizeof(attr));
+	attr.target_fd	   = target_fd;
+	attr.attach_bpf_fd = prog_fd;
+	attr.attach_type   = type;
+
+	// BPF_PROG_ATTACH = 8
+	return syscall(__NR_bpf, 8, &attr, sizeof(attr));
+}
 */
 import "C"
 
@@ -54,10 +68,10 @@ type Module struct {
 	fileName string
 	file     *elf.File
 
-	log    []byte
-	maps   map[string]*Map
-	probes map[string]*Kprobe
-	cgroup map[string]*CgroupBPF
+	log            []byte
+	maps           map[string]*Map
+	probes         map[string]*Kprobe
+	cgroupPrograms map[string]*CgroupProgram
 }
 
 // Kprobe represents a kprobe or kretprobe and has to be declared
@@ -69,19 +83,28 @@ type Kprobe struct {
 	efd   int
 }
 
-type CgroupBPF struct {
+type AttachType int
+
+const (
+	IngressType AttachType = iota
+	EgressType
+	SockCreateType
+)
+
+// CgroupProgram represents a cgroup skb/sock program
+type CgroupProgram struct {
 	Name  string
 	insns *C.struct_bpf_insn
-	Fd    int
+	fd    int
 	efd   int
 }
 
 func NewModule(fileName string) *Module {
 	return &Module{
-		fileName: fileName,
-		probes:   make(map[string]*Kprobe),
-		cgroup:   make(map[string]*CgroupBPF),
-		log:      make([]byte, 65536),
+		fileName:       fileName,
+		probes:         make(map[string]*Kprobe),
+		cgroupPrograms: make(map[string]*CgroupProgram),
+		log:            make([]byte, 65536),
 	}
 }
 
@@ -165,17 +188,34 @@ func (b *Module) EnableKprobes() error {
 	return nil
 }
 
-func (b *Module) IterCgroup() <-chan *CgroupBPF {
-	ch := make(chan *CgroupBPF)
+func (b *Module) IterCgroupProgram() <-chan *CgroupProgram {
+	ch := make(chan *CgroupProgram)
 	go func() {
-		for name := range b.cgroup {
-			ch <- b.cgroup[name]
+		for name := range b.cgroupPrograms {
+			ch <- b.cgroupPrograms[name]
 		}
 		close(ch)
 	}()
 	return ch
 }
 
-func (b *Module) Cgroup(name string) *CgroupBPF {
-	return b.cgroup[name]
+func (b *Module) CgroupProgram(name string) *CgroupProgram {
+	return b.cgroupPrograms[name]
+}
+
+func (b *Module) AttachProgram(cgroupProg *CgroupProgram, cgroupPath string, attachType AttachType) error {
+	f, err := os.Open(cgroupPath)
+	if err != nil {
+		return fmt.Errorf("error opening cgroup %q: %v", cgroupPath, err)
+	}
+	defer f.Close()
+
+	progFd := C.int(cgroupProg.fd)
+	cgroupFd := C.int(f.Fd())
+	ret, err := C.bpf_prog_attach(progFd, cgroupFd, uint32(attachType))
+	if ret < 0 {
+		return fmt.Errorf("failed to attach prog to cgroup %q: %v\n", cgroupPath, err)
+	}
+
+	return nil
 }

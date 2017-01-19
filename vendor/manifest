@@ -5,7 +5,7 @@
 			"importpath": "github.com/iovisor/gobpf/elf",
 			"repository": "https://github.com/iovisor/gobpf",
 			"vcs": "git",
-			"revision": "cbe6918ee9120e0531e5d1f4efd95e82c9c5eda1",
+			"revision": "665cc05f4f7b1bb10210437295aa3daa2f103836",
 			"branch": "iaguis/cgroup-skb",
 			"path": "/elf",
 			"notests": true

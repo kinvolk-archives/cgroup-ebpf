@@ -43,7 +43,7 @@ import (
 #include <assert.h>
 #include <sys/socket.h>
 #include <linux/unistd.h>
-#include <linux/bpf.h>
+#include "include/bpf.h"
 #include <poll.h>
 #include <linux/perf_event.h>
 #include <sys/resource.h>
@@ -420,11 +420,9 @@ func (b *Module) Load() error {
 			case isKretprobe:
 				progType = uint32(C.BPF_PROG_TYPE_KPROBE)
 			case isCgroupSkb:
-				// BPF_PROG_TYPE_CGROUP_SKB
-				progType = 8
+				progType = uint32(C.BPF_PROG_TYPE_CGROUP_SKB)
 			case isCgroupSock:
-				// BPF_PROG_TYPE_CGROUP_SOCK
-				progType = 9
+				progType = uint32(C.BPF_PROG_TYPE_CGROUP_SOCK)
 			}
 
 			if isKprobe || isKretprobe || isCgroupSkb || isCgroupSock {
@@ -464,10 +462,10 @@ func (b *Module) Load() error {
 				case isCgroupSkb:
 					fallthrough
 				case isCgroupSock:
-					b.cgroup[secName] = &CgroupBPF{
+					b.cgroupPrograms[secName] = &CgroupProgram{
 						Name:  secName,
 						insns: insns,
-						Fd:    int(progFd),
+						fd:    int(progFd),
 					}
 				}
 			}
@@ -493,11 +491,9 @@ func (b *Module) Load() error {
 		case isKretprobe:
 			progType = uint32(C.BPF_PROG_TYPE_KPROBE)
 		case isCgroupSkb:
-			// BPF_PROG_TYPE_CGROUP_SKB
-			progType = 8
+			progType = uint32(C.BPF_PROG_TYPE_CGROUP_SKB)
 		case isCgroupSock:
-			// BPF_PROG_TYPE_CGROUP_SOCK
-			progType = 9
+			progType = uint32(C.BPF_PROG_TYPE_CGROUP_SOCK)
 		}
 
 		if isKprobe || isKretprobe || isCgroupSkb || isCgroupSock {
@@ -532,10 +528,10 @@ func (b *Module) Load() error {
 			case isCgroupSkb:
 				fallthrough
 			case isCgroupSock:
-				b.cgroup[secName] = &CgroupBPF{
+				b.cgroupPrograms[secName] = &CgroupProgram{
 					Name:  secName,
 					insns: insns,
-					Fd:    int(progFd),
+					fd:    int(progFd),
 				}
 			}
 		}
