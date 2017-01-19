@@ -7,5 +7,6 @@ build:
 	-Wno-unused-value -Wno-pointer-sign -Wno-compare-distinct-pointer-types \
 			-O2 -emit-llvm -c bpf/cgroup-tracer-bpf.c \
 			$(foreach path,$(LINUX_HEADERS), -I $(path)/arch/x86/include -I $(path)/arch/x86/include/generated -I $(path)/include -I $(path)/include/generated/uapi -I $(path)/arch/x86/include/uapi -I $(path)/include/uapi) \
+			-I vendor/github.com/iovisor/gobpf/elf/include/ \
 			-o - | llc -march=bpf -filetype=obj -o "${DEST_DIR}/ebpf.o"
 	go build

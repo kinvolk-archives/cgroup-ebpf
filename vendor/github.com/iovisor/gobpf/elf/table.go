@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"syscall"
 	"unsafe"
+
+	"github.com/cilium/cilium/pkg/bpf"
 )
 
 /*
@@ -105,4 +107,9 @@ func (b *Module) LookupElement(mp *Map, key, value unsafe.Pointer) error {
 	}
 
 	return nil
+}
+
+func (b *Module) MapPin(name, pathname string) error {
+	m := b.maps[name]
+	return bpf.ObjPin(int(m.m.fd), pathname)
 }

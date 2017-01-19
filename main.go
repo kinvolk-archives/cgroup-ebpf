@@ -17,11 +17,14 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 	"unsafe"
 
 	"github.com/iovisor/gobpf/elf"
 )
+
+const mapPath = "/sys/fs/bpf/kinvolk/cgroup_tracer/bytes_per_ip"
 
 func main() {
 	if len(os.Args) != 3 {
@@ -51,15 +54,19 @@ func main() {
 	zero := 0
 	packets_key := zero
 	bytes_key := 1
-	mp := b.Map("count")
-
-	if err := b.UpdateElement(mp, unsafe.Pointer(&packets_key), unsafe.Pointer(&zero), 0); err != nil {
-		fmt.Fprintf(os.Stderr, "error updating map: %v\n", err)
+	mp := b.Map("bytes_per_ip")
+	if mp == nil {
+		fmt.Fprintf(os.Stderr, "map \"bytes_per_ip\" not found\n")
 		os.Exit(1)
 	}
 
-	if err := b.UpdateElement(mp, unsafe.Pointer(&bytes_key), unsafe.Pointer(&zero), 0); err != nil {
-		fmt.Fprintf(os.Stderr, "error updating map: %v\n", err)
+	if err := os.MkdirAll(filepath.Dir(mapPath), 0700); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+
+	if err := b.MapPin(mp.Name, mapPath); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 
