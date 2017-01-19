@@ -11,7 +11,7 @@ import (
 
 func main() {
 	if len(os.Args) != 3 {
-		fmt.Fprintf(os.Stderr, "Usage: %s .../ebpf.o cgroup-path\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s out/ebpf.o cgroup-path\n", os.Args[0])
 		os.Exit(1)
 	}
 	fileName := os.Args[1]
