@@ -12,11 +12,11 @@
  * limitations under the License.
  */
 
-#include <linux/kconfig.h>
+#include <stddef.h>
+#include <stdlib.h>
 #include <linux/bpf.h>
-#include <uapi/linux/tcp.h>
-#include <uapi/linux/if_ether.h>
-#include <uapi/linux/ip.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
 #include "bpf_helpers.h"
 
 struct bpf_map_def SEC("maps/count") count_map = {
@@ -30,8 +30,8 @@ SEC("cgroup/skb")
 int count_packets(struct __sk_buff *skb)
 {
 	int packets_key = 0, bytes_key = 1;
-	u64 *packets = NULL;
-	u64 *bytes = NULL;
+	__u64 *packets = NULL;
+	__u64 *bytes = NULL;
 
 	packets = bpf_map_lookup_elem(&count_map, &packets_key);
 	if (packets == NULL)
@@ -43,10 +43,10 @@ int count_packets(struct __sk_buff *skb)
 	if (bytes == NULL)
 		return 0;
 
-	u16 dest = 0;
+	__u16 dest = 0;
 	bpf_skb_load_bytes(skb, sizeof(struct iphdr) + offsetof(struct tcphdr, dest), &dest, sizeof(dest));
 
-	if (dest == ntohs(80))
+	if (dest == __constant_ntohs(80))
 		*bytes += skb->len;
 
 	// don't drop
