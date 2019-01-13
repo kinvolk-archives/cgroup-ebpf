@@ -26,4 +26,4 @@ sudo ./cgroup-ebpf out/ebpf.o /sys/fs/cgroup/unified/demo/
 
 # Vendoring
 
-We use [gvt](https://github.com/FiloSottile/gvt).
+We use [dep](https://golang.github.io/dep/).

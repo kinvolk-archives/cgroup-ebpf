@@ -26,13 +26,19 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"unsafe"
+
+	"github.com/iovisor/gobpf/pkg/bpffs"
+	"github.com/iovisor/gobpf/pkg/cpuonline"
 )
 
 /*
+#define _GNU_SOURCE
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,24 +50,20 @@ import (
 #include <sys/socket.h>
 #include <linux/unistd.h>
 #include "include/bpf.h"
+#include "include/bpf_map.h"
 #include <poll.h>
 #include <linux/perf_event.h>
 #include <sys/resource.h>
-
-// from https://github.com/safchain/goebpf
-// Apache License, Version 2.0
-
-typedef struct bpf_map_def {
-  unsigned int type;
-  unsigned int key_size;
-  unsigned int value_size;
-  unsigned int max_entries;
-} bpf_map_def;
 
 typedef struct bpf_map {
 	int         fd;
 	bpf_map_def def;
 } bpf_map;
+
+// from https://github.com/safchain/goebpf
+// Apache License, Version 2.0
+
+extern int bpf_pin_object(int fd, const char *pathname);
 
 __u64 ptr_to_u64(void *ptr)
 {
@@ -113,9 +115,25 @@ static int bpf_create_map(enum bpf_map_type map_type, int key_size,
 	return ret;
 }
 
-static bpf_map *bpf_load_map(bpf_map_def *map_def)
+void create_bpf_obj_get(const char *pathname, void *attr)
+{
+	union bpf_attr *ptr_bpf_attr;
+	ptr_bpf_attr = (union bpf_attr *)attr;
+	ptr_bpf_attr->pathname = ptr_to_u64((void *) pathname);
+}
+
+int get_pinned_obj_fd(const char *path)
+{
+	union bpf_attr attr = {};
+	create_bpf_obj_get(path, &attr);
+	return syscall(__NR_bpf, BPF_OBJ_GET, &attr, sizeof(attr));
+}
+
+static bpf_map *bpf_load_map(bpf_map_def *map_def, const char *path)
 {
 	bpf_map *map;
+	struct stat st;
+	int ret, do_pin = 0;
 
 	map = calloc(1, sizeof(bpf_map));
 	if (map == NULL)
@@ -123,14 +141,39 @@ static bpf_map *bpf_load_map(bpf_map_def *map_def)
 
 	memcpy(&map->def, map_def, sizeof(bpf_map_def));
 
+	switch (map_def->pinning) {
+	case 1: // PIN_OBJECT_NS
+		// TODO to be implemented
+		return 0;
+	case 2: // PIN_GLOBAL_NS
+	case 3: // PIN_CUSTOM_NS
+		if (stat(path, &st) == 0) {
+			ret = get_pinned_obj_fd(path);
+			if (ret < 0) {
+				return 0;
+			}
+			map->fd = ret;
+			return map;
+		}
+		do_pin = 1;
+	}
+
 	map->fd = bpf_create_map(map_def->type,
 		map_def->key_size,
 		map_def->value_size,
 		map_def->max_entries
 	);
 
-	if (map->fd < 0)
+	if (map->fd < 0) {
 		return 0;
+	}
+
+	if (do_pin) {
+		ret = bpf_pin_object(map->fd, path);
+		if (ret < 0) {
+			return 0;
+		}
+	}
 
 	return map;
 }
@@ -203,13 +246,23 @@ static int perf_event_open_map(int pid, int cpu, int group_fd, unsigned long fla
 	attr.size = sizeof(struct perf_event_attr);
 	attr.config = 10; // PERF_COUNT_SW_BPF_OUTPUT
 
-       return syscall(__NR_perf_event_open, &attr, pid, cpu,
-                      group_fd, flags);
+	return syscall(__NR_perf_event_open, &attr, pid, cpu,
+		       group_fd, flags);
 }
 */
 import "C"
 
-const useCurrentKernelVersion = 0xFFFFFFFE
+const (
+	useCurrentKernelVersion = 0xFFFFFFFE
+
+	// Object pin settings should correspond to those of other projects, e.g.:
+	// https://git.kernel.org/pub/scm/linux/kernel/git/shemminger/iproute2.git/tree/include/bpf_elf.h#n25
+	// Also it should be self-consistent with `elf/include/bpf.h` in the same repository.
+	PIN_NONE      = 0
+	PIN_OBJECT_NS = 1
+	PIN_GLOBAL_NS = 2
+	PIN_CUSTOM_NS = 3
+)
 
 // Based on https://github.com/safchain/goebpf
 // Apache License
@@ -235,48 +288,107 @@ func elfReadVersion(file *elf.File) (uint32, error) {
 			return 0, errors.New("version is not a __u32")
 		}
 		version := *(*C.uint32_t)(unsafe.Pointer(&data[0]))
-		if err != nil {
-			return 0, err
-		}
 		return uint32(version), nil
 	}
 	return 0, nil
 }
 
-func elfReadMaps(file *elf.File) (map[string]*Map, error) {
-	maps := make(map[string]*Map)
-	for sectionIdx, section := range file.Sections {
-		if strings.HasPrefix(section.Name, "maps/") {
-			data, err := section.Data()
-			if err != nil {
-				return nil, err
-			}
+func createPinPath(path string) (string, error) {
+	if err := bpffs.Mount(); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), syscall.S_IRWXU); err != nil {
+		return "", fmt.Errorf("error creating map directory %q: %v", filepath.Dir(path), err)
+	}
+	return path, nil
+}
 
-			name := strings.TrimPrefix(section.Name, "maps/")
+func validateMapPath(path string) bool {
+	if !strings.HasPrefix(path, BPFFSPath) {
+		return false
+	}
 
-			mapCount := len(data) / C.sizeof_struct_bpf_map_def
-			for i := 0; i < mapCount; i++ {
-				pos := i * C.sizeof_struct_bpf_map_def
-				cm := C.bpf_load_map((*C.bpf_map_def)(unsafe.Pointer(&data[pos])))
-				if cm == nil {
-					return nil, fmt.Errorf("error while loading map %s", section.Name)
-				}
+	return filepath.Clean(path) == path
+}
 
-				m := &Map{
-					Name:       name,
-					SectionIdx: sectionIdx,
-					Idx:        i,
-					m:          cm,
-				}
+func getMapNamespace(mapDef *C.bpf_map_def) string {
+	namespacePtr := &mapDef.namespace[0]
+	return C.GoStringN(namespacePtr, C.int(C.strnlen(namespacePtr, C.BUF_SIZE_MAP_NS)))
+}
 
-				if oldMap, ok := maps[name]; ok {
-					return nil, fmt.Errorf("duplicate map: %q (section %q) and %q (section %q)",
-						oldMap.Name, file.Sections[oldMap.SectionIdx].Name,
-						name, section.Name)
-				}
-				maps[name] = m
-			}
+func getMapPath(mapDef *C.bpf_map_def, mapName, pinPath string) (string, error) {
+	var mapPath string
+	switch mapDef.pinning {
+	case PIN_OBJECT_NS:
+		return "", fmt.Errorf("not implemented yet")
+	case PIN_GLOBAL_NS:
+		namespace := getMapNamespace(mapDef)
+		if namespace == "" {
+			return "", fmt.Errorf("map %q has empty namespace", mapName)
 		}
+		mapPath = filepath.Join(BPFFSPath, namespace, BPFDirGlobals, mapName)
+	case PIN_CUSTOM_NS:
+		if pinPath == "" {
+			return "", fmt.Errorf("no pin path given for map %q with PIN_CUSTOM_NS", mapName)
+		}
+		mapPath = filepath.Join(BPFFSPath, pinPath)
+	default:
+		// map is not pinned
+		return "", nil
+	}
+	return mapPath, nil
+}
+
+func createMapPath(mapDef *C.bpf_map_def, mapName string, params SectionParams) (string, error) {
+	mapPath, err := getMapPath(mapDef, mapName, params.PinPath)
+	if err != nil || mapPath == "" {
+		return "", err
+	}
+	if !validateMapPath(mapPath) {
+		return "", fmt.Errorf("invalid path %q", mapPath)
+	}
+	return createPinPath(mapPath)
+}
+
+func elfReadMaps(file *elf.File, params map[string]SectionParams) (map[string]*Map, error) {
+	maps := make(map[string]*Map)
+	for _, section := range file.Sections {
+		if !strings.HasPrefix(section.Name, "maps/") {
+			continue
+		}
+
+		data, err := section.Data()
+		if err != nil {
+			return nil, err
+		}
+		if len(data) != C.sizeof_struct_bpf_map_def {
+			return nil, fmt.Errorf("only one map with size %d bytes allowed per section (check bpf_map_def)", C.sizeof_struct_bpf_map_def)
+		}
+
+		name := strings.TrimPrefix(section.Name, "maps/")
+
+		mapDef := (*C.bpf_map_def)(unsafe.Pointer(&data[0]))
+
+		mapPath, err := createMapPath(mapDef, name, params[section.Name])
+		if err != nil {
+			return nil, err
+		}
+		mapPathC := C.CString(mapPath)
+		defer C.free(unsafe.Pointer(mapPathC))
+
+		cm, err := C.bpf_load_map(mapDef, mapPathC)
+		if cm == nil {
+			return nil, fmt.Errorf("error while loading map %q: %v", section.Name, err)
+		}
+
+		if oldMap, ok := maps[name]; ok {
+			return nil, fmt.Errorf("duplicate map: %q and %q", oldMap.Name, name)
+		}
+		maps[name] = &Map{
+			Name: name,
+			m:    cm,
+		}
+
 	}
 	return maps, nil
 }
@@ -328,7 +440,12 @@ func (b *Module) relocate(data []byte, rdata []byte) error {
 
 		rinsn := (*C.struct_bpf_insn)(unsafe.Pointer(&rdata[offset]))
 		if rinsn.code != (C.BPF_LD | C.BPF_IMM | C.BPF_DW) {
-			return errors.New("invalid relocation")
+			symbolSec := b.file.Sections[symbol.Section]
+
+			return fmt.Errorf("invalid relocation: insn code=%#x, symbol name=%s\nsymbol section: Name=%s, Type=%s, Flags=%s",
+				*(*C.uchar)(unsafe.Pointer(&rinsn.code)), symbol.Name,
+				symbolSec.Name, symbolSec.Type.String(), symbolSec.Flags.String(),
+			)
 		}
 
 		symbolSec := b.file.Sections[symbol.Section]
@@ -348,17 +465,29 @@ func (b *Module) relocate(data []byte, rdata []byte) error {
 	}
 }
 
-func (b *Module) Load() error {
-	fileReader, err := os.Open(b.fileName)
-	if err != nil {
-		return err
+type SectionParams struct {
+	PerfRingBufferPageCount   int
+	SkipPerfMapInitialization bool
+	PinPath                   string // path to be pinned, relative to "/sys/fs/bpf"
+}
+
+// Load loads the BPF programs and BPF maps in the module. Each ELF section
+// can optionally have parameters that changes how it is configured.
+func (b *Module) Load(parameters map[string]SectionParams) error {
+	if b.fileName != "" {
+		fileReader, err := os.Open(b.fileName)
+		if err != nil {
+			return err
+		}
+		defer fileReader.Close()
+		b.fileReader = fileReader
 	}
 
-	b.file, err = elf.NewFile(fileReader)
+	var err error
+	b.file, err = elf.NewFile(b.fileReader)
 	if err != nil {
 		return err
 	}
-	defer fileReader.Close()
 
 	license, err := elfReadLicense(b.file)
 	if err != nil {
@@ -373,13 +502,13 @@ func (b *Module) Load() error {
 		return err
 	}
 	if version == useCurrentKernelVersion {
-		version, err = currentVersion()
+		version, err = CurrentKernelVersion()
 		if err != nil {
 			return err
 		}
 	}
 
-	maps, err := elfReadMaps(b.file)
+	maps, err := elfReadMaps(b.file, parameters)
 	if err != nil {
 		return err
 	}
@@ -412,6 +541,10 @@ func (b *Module) Load() error {
 			isKretprobe := strings.HasPrefix(secName, "kretprobe/")
 			isCgroupSkb := strings.HasPrefix(secName, "cgroup/skb")
 			isCgroupSock := strings.HasPrefix(secName, "cgroup/sock")
+			isSocketFilter := strings.HasPrefix(secName, "socket")
+			isTracepoint := strings.HasPrefix(secName, "tracepoint/")
+			isSchedCls := strings.HasPrefix(secName, "sched_cls/")
+			isSchedAct := strings.HasPrefix(secName, "sched_act/")
 
 			var progType uint32
 			switch {
@@ -423,9 +556,17 @@ func (b *Module) Load() error {
 				progType = uint32(C.BPF_PROG_TYPE_CGROUP_SKB)
 			case isCgroupSock:
 				progType = uint32(C.BPF_PROG_TYPE_CGROUP_SOCK)
+			case isSocketFilter:
+				progType = uint32(C.BPF_PROG_TYPE_SOCKET_FILTER)
+			case isTracepoint:
+				progType = uint32(C.BPF_PROG_TYPE_TRACEPOINT)
+			case isSchedCls:
+				progType = uint32(C.BPF_PROG_TYPE_SCHED_CLS)
+			case isSchedAct:
+				progType = uint32(C.BPF_PROG_TYPE_SCHED_ACT)
 			}
 
-			if isKprobe || isKretprobe || isCgroupSkb || isCgroupSock {
+			if isKprobe || isKretprobe || isCgroupSkb || isCgroupSock || isSocketFilter || isTracepoint || isSchedCls || isSchedAct {
 				rdata, err := rsection.Data()
 				if err != nil {
 					return err
@@ -442,12 +583,12 @@ func (b *Module) Load() error {
 
 				insns := (*C.struct_bpf_insn)(unsafe.Pointer(&rdata[0]))
 
-				progFd := C.bpf_prog_load(progType,
+				progFd, err := C.bpf_prog_load(progType,
 					insns, C.int(rsection.Size),
 					(*C.char)(lp), C.int(version),
 					(*C.char)(unsafe.Pointer(&b.log[0])), C.int(len(b.log)))
 				if progFd < 0 {
-					return fmt.Errorf("error while loading %q:\n%s", secName, b.log)
+					return fmt.Errorf("error while loading %q (%v):\n%s", secName, err, b.log)
 				}
 
 				switch {
@@ -458,11 +599,32 @@ func (b *Module) Load() error {
 						Name:  secName,
 						insns: insns,
 						fd:    int(progFd),
+						efd:   -1,
 					}
 				case isCgroupSkb:
 					fallthrough
 				case isCgroupSock:
 					b.cgroupPrograms[secName] = &CgroupProgram{
+						Name:  secName,
+						insns: insns,
+						fd:    int(progFd),
+					}
+				case isSocketFilter:
+					b.socketFilters[secName] = &SocketFilter{
+						Name:  secName,
+						insns: insns,
+						fd:    int(progFd),
+					}
+				case isTracepoint:
+					b.tracepointPrograms[secName] = &TracepointProgram{
+						Name:  secName,
+						insns: insns,
+						fd:    int(progFd),
+					}
+				case isSchedCls:
+					fallthrough
+				case isSchedAct:
+					b.schedPrograms[secName] = &SchedProgram{
 						Name:  secName,
 						insns: insns,
 						fd:    int(progFd),
@@ -483,6 +645,10 @@ func (b *Module) Load() error {
 		isKretprobe := strings.HasPrefix(secName, "kretprobe/")
 		isCgroupSkb := strings.HasPrefix(secName, "cgroup/skb")
 		isCgroupSock := strings.HasPrefix(secName, "cgroup/sock")
+		isSocketFilter := strings.HasPrefix(secName, "socket")
+		isTracepoint := strings.HasPrefix(secName, "tracepoint/")
+		isSchedCls := strings.HasPrefix(secName, "sched_cls/")
+		isSchedAct := strings.HasPrefix(secName, "sched_act/")
 
 		var progType uint32
 		switch {
@@ -494,9 +660,17 @@ func (b *Module) Load() error {
 			progType = uint32(C.BPF_PROG_TYPE_CGROUP_SKB)
 		case isCgroupSock:
 			progType = uint32(C.BPF_PROG_TYPE_CGROUP_SOCK)
+		case isSocketFilter:
+			progType = uint32(C.BPF_PROG_TYPE_SOCKET_FILTER)
+		case isTracepoint:
+			progType = uint32(C.BPF_PROG_TYPE_TRACEPOINT)
+		case isSchedCls:
+			progType = uint32(C.BPF_PROG_TYPE_SCHED_CLS)
+		case isSchedAct:
+			progType = uint32(C.BPF_PROG_TYPE_SCHED_ACT)
 		}
 
-		if isKprobe || isKretprobe || isCgroupSkb || isCgroupSock {
+		if isKprobe || isKretprobe || isCgroupSkb || isCgroupSock || isSocketFilter || isTracepoint || isSchedCls || isSchedAct {
 			data, err := section.Data()
 			if err != nil {
 				return err
@@ -508,12 +682,12 @@ func (b *Module) Load() error {
 
 			insns := (*C.struct_bpf_insn)(unsafe.Pointer(&data[0]))
 
-			progFd := C.bpf_prog_load(progType,
+			progFd, err := C.bpf_prog_load(progType,
 				insns, C.int(section.Size),
 				(*C.char)(lp), C.int(version),
 				(*C.char)(unsafe.Pointer(&b.log[0])), C.int(len(b.log)))
 			if progFd < 0 {
-				return fmt.Errorf("error while loading %q:\n%s", section.Name, b.log)
+				return fmt.Errorf("error while loading %q (%v):\n%s", section.Name, err, b.log)
 			}
 
 			switch {
@@ -524,6 +698,7 @@ func (b *Module) Load() error {
 					Name:  secName,
 					insns: insns,
 					fd:    int(progFd),
+					efd:   -1,
 				}
 			case isCgroupSkb:
 				fallthrough
@@ -533,26 +708,69 @@ func (b *Module) Load() error {
 					insns: insns,
 					fd:    int(progFd),
 				}
+			case isSocketFilter:
+				b.socketFilters[secName] = &SocketFilter{
+					Name:  secName,
+					insns: insns,
+					fd:    int(progFd),
+				}
+			case isTracepoint:
+				b.tracepointPrograms[secName] = &TracepointProgram{
+					Name:  secName,
+					insns: insns,
+					fd:    int(progFd),
+				}
+			case isSchedCls:
+				fallthrough
+			case isSchedAct:
+				b.schedPrograms[secName] = &SchedProgram{
+					Name:  secName,
+					insns: insns,
+					fd:    int(progFd),
+				}
 			}
 		}
 	}
 
-	for name, _ := range b.maps {
-		var cpu C.int = 0
+	return b.initializePerfMaps(parameters)
+}
 
-		for {
-			pmuFD := C.perf_event_open_map(-1 /* pid */, cpu /* cpu */, -1 /* group_fd */, C.PERF_FLAG_FD_CLOEXEC)
-			if pmuFD < 0 {
-				if cpu == 0 {
-					return fmt.Errorf("perf_event_open for map error: %v", err)
+func (b *Module) initializePerfMaps(parameters map[string]SectionParams) error {
+	for name, m := range b.maps {
+		if m.m != nil && m.m.def._type != C.BPF_MAP_TYPE_PERF_EVENT_ARRAY {
+			continue
+		}
+
+		pageSize := os.Getpagesize()
+		b.maps[name].pageCount = 8 // reasonable default
+
+		sectionName := "maps/" + name
+		if params, ok := parameters[sectionName]; ok {
+			if params.SkipPerfMapInitialization {
+				continue
+			}
+			if params.PerfRingBufferPageCount > 0 {
+				if (params.PerfRingBufferPageCount & (params.PerfRingBufferPageCount - 1)) != 0 {
+					return fmt.Errorf("number of pages (%d) must be stricly positive and a power of 2", params.PerfRingBufferPageCount)
 				}
-				break
+				b.maps[name].pageCount = params.PerfRingBufferPageCount
+			}
+		}
+
+		cpus, err := cpuonline.Get()
+		if err != nil {
+			return fmt.Errorf("failed to determine online cpus: %v", err)
+		}
+
+		for _, cpu := range cpus {
+			cpuC := C.int(cpu)
+			pmuFD, err := C.perf_event_open_map(-1 /* pid */, cpuC /* cpu */, -1 /* group_fd */, C.PERF_FLAG_FD_CLOEXEC)
+			if pmuFD < 0 {
+				return fmt.Errorf("perf_event_open for map error: %v", err)
 			}
 
 			// mmap
-			pageSize := os.Getpagesize()
-			pageCount := 8
-			mmapSize := pageSize * (pageCount + 1)
+			mmapSize := pageSize * (b.maps[name].pageCount + 1)
 
 			base, err := syscall.Mmap(int(pmuFD), 0, mmapSize, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
 			if err != nil {
@@ -565,32 +783,30 @@ func (b *Module) Load() error {
 				return fmt.Errorf("error enabling perf event: %v", err2)
 			}
 
-			// assign perf fd tp map
-			ret, err := C.bpf_update_element(C.int(b.maps[name].m.fd), unsafe.Pointer(&cpu), unsafe.Pointer(&pmuFD), C.BPF_ANY)
+			// assign perf fd to map
+			ret, err := C.bpf_update_element(C.int(b.maps[name].m.fd), unsafe.Pointer(&cpuC), unsafe.Pointer(&pmuFD), C.BPF_ANY)
 			if ret != 0 {
-				return fmt.Errorf("cannot assign perf fd to map %q: %s (cpu %d)", name, err, cpu)
+				return fmt.Errorf("cannot assign perf fd to map %q: %v (cpu %d)", name, err, cpuC)
 			}
 
 			b.maps[name].pmuFDs = append(b.maps[name].pmuFDs, pmuFD)
 			b.maps[name].headers = append(b.maps[name].headers, (*C.struct_perf_event_mmap_page)(unsafe.Pointer(&base[0])))
-
-			cpu++
 		}
 	}
+
 	return nil
 }
 
 // Map represents a eBPF map. An eBPF map has to be declared in the
 // C file.
 type Map struct {
-	Name       string
-	SectionIdx int
-	Idx        int
-	m          *C.bpf_map
+	Name string
+	m    *C.bpf_map
 
 	// only for perf maps
-	pmuFDs  []C.int
-	headers []*C.struct_perf_event_mmap_page
+	pmuFDs    []C.int
+	headers   []*C.struct_perf_event_mmap_page
+	pageCount int
 }
 
 func (b *Module) IterMaps() <-chan *Map {
@@ -606,4 +822,8 @@ func (b *Module) IterMaps() <-chan *Map {
 
 func (b *Module) Map(name string) *Map {
 	return b.maps[name]
+}
+
+func (m *Map) Fd() int {
+	return int(m.m.fd)
 }

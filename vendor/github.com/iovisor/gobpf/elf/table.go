@@ -52,6 +52,15 @@ static void create_bpf_lookup_elem(int fd, void *key, void *value, void *attr)
 	ptr_bpf_attr->key = ptr_to_u64(key);
 	ptr_bpf_attr->value = ptr_to_u64(value);
 }
+
+static int next_bpf_elem(int fd, void *key, void *next_key, void *attr)
+{
+	union bpf_attr* ptr_bpf_attr;
+	ptr_bpf_attr = (union bpf_attr*)attr;
+	ptr_bpf_attr->map_fd = fd;
+	ptr_bpf_attr->key = ptr_to_u64(key);
+	ptr_bpf_attr->next_key = ptr_to_u64(next_key);
+}
 */
 import "C"
 
@@ -105,4 +114,59 @@ func (b *Module) LookupElement(mp *Map, key, value unsafe.Pointer) error {
 	}
 
 	return nil
+}
+
+// DeleteElement deletes the given key in the the map stored in mp.
+// The key is stored in the key unsafe.Pointer.
+func (b *Module) DeleteElement(mp *Map, key unsafe.Pointer) error {
+	uba := C.union_bpf_attr{}
+	value := unsafe.Pointer(nil)
+	C.create_bpf_lookup_elem(
+		C.int(mp.m.fd),
+		key,
+		value,
+		unsafe.Pointer(&uba),
+	)
+	ret, _, err := syscall.Syscall(
+		C.__NR_bpf,
+		C.BPF_MAP_DELETE_ELEM,
+		uintptr(unsafe.Pointer(&uba)),
+		unsafe.Sizeof(uba),
+	)
+
+	if ret != 0 || err != 0 {
+		return fmt.Errorf("unable to delete element: %s", err)
+	}
+
+	return nil
+}
+
+// LookupNextElement looks up the next element in mp using the given key.
+// The next key and the value are stored in the nextKey and value parameter.
+// Returns false at the end of the mp.
+func (b *Module) LookupNextElement(mp *Map, key, nextKey, value unsafe.Pointer) (bool, error) {
+	uba := C.union_bpf_attr{}
+	C.next_bpf_elem(
+		C.int(mp.m.fd),
+		key,
+		nextKey,
+		unsafe.Pointer(&uba),
+	)
+	ret, _, err := syscall.Syscall(
+		C.__NR_bpf,
+		C.BPF_MAP_GET_NEXT_KEY,
+		uintptr(unsafe.Pointer(&uba)),
+		unsafe.Sizeof(uba),
+	)
+	if err != 0 {
+		return false, fmt.Errorf("unable to find next element: %s", err)
+	}
+	if ret != 0 {
+		return false, nil
+	}
+
+	if err := b.LookupElement(mp, nextKey, value); err != nil {
+		return false, err
+	}
+	return true, nil
 }

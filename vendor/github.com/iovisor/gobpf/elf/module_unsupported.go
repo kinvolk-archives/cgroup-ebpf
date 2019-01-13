@@ -2,16 +2,25 @@
 
 package elf
 
-import "fmt"
+import (
+	"fmt"
+	"io"
+)
 
 type Module struct{}
 type Kprobe struct{}
+type CgroupProgram struct{}
+type AttachType struct{}
 
 func NewModule(fileName string) *Module {
 	return nil
 }
 
-func (b *Module) EnableKprobe(secName string) error {
+func NewModuleFromReader(fileReader io.ReaderAt) *Module {
+	return nil
+}
+
+func (b *Module) EnableKprobe(secName string, maxactive int) error {
 	return fmt.Errorf("not supported")
 }
 
@@ -19,7 +28,7 @@ func (b *Module) IterKprobes() <-chan *Kprobe {
 	return nil
 }
 
-func (b *Module) EnableKprobes() error {
+func (b *Module) EnableKprobes(maxactive int) error {
 	return fmt.Errorf("not supported")
 }
 
@@ -28,6 +37,10 @@ func (b *Module) IterCgroupProgram() <-chan *CgroupProgram {
 }
 
 func (b *Module) CgroupProgram(name string) *CgroupProgram {
+	return nil
+}
+
+func (b *Module) Kprobe(name string) *Kprobe {
 	return nil
 }
 

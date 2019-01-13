@@ -35,14 +35,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	err := b.Load()
+	err := b.Load(nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 
 	for cgProg := range b.IterCgroupProgram() {
-		if err := b.AttachProgram(cgProg, os.Args[2], elf.EgressType); err != nil {
+		if err := elf.AttachCgroupProgram(cgProg, os.Args[2], elf.EgressType); err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)
 		}
