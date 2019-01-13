@@ -69,6 +69,8 @@ unsigned long long load_half(void *skb,
 unsigned long long load_word(void *skb,
 			     unsigned long long off) asm("llvm.bpf.load.word");
 
+#define BUF_SIZE_MAP_NS 256
+
 /* a helper structure used by eBPF C program
  * to describe map attributes to elf_bpf loader
  */
@@ -78,6 +80,8 @@ struct bpf_map_def {
 	unsigned int value_size;
 	unsigned int max_entries;
 	unsigned int map_flags;
+	unsigned int pinning;
+	char namespace[BUF_SIZE_MAP_NS];
 };
 
 static int (*bpf_skb_load_bytes)(void *ctx, int off, void *to, int len) =
