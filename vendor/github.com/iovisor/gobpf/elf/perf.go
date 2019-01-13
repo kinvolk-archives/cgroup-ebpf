@@ -106,8 +106,11 @@ import "C"
 type PerfMap struct {
 	name         string
 	program      *Module
+	pageCount    int
 	receiverChan chan []byte
-	pollStop     chan bool
+	lostChan     chan uint64
+	pollStop     chan struct{}
+	timestamp    func(*[]byte) uint64
 }
 
 // Matching 'struct perf_event_sample in kernel sources
@@ -117,22 +120,39 @@ type PerfEventSample struct {
 	data byte // Size bytes of data
 }
 
-func InitPerfMap(b *Module, mapName string, receiverChan chan []byte) (*PerfMap, error) {
-	_, ok := b.maps[mapName]
+func InitPerfMap(b *Module, mapName string, receiverChan chan []byte, lostChan chan uint64) (*PerfMap, error) {
+	m, ok := b.maps[mapName]
 	if !ok {
 		return nil, fmt.Errorf("no map with name %s", mapName)
+	}
+	if receiverChan == nil {
+		return nil, fmt.Errorf("receiverChan is nil")
 	}
 	// Maps are initialized in b.Load(), nothing to do here
 	return &PerfMap{
 		name:         mapName,
 		program:      b,
+		pageCount:    m.pageCount,
 		receiverChan: receiverChan,
-		pollStop:     make(chan bool),
+		lostChan:     lostChan,
+		pollStop:     make(chan struct{}),
 	}, nil
 }
 
+// SetTimestampFunc registers a timestamp callback that will be used to
+// reorder the perf events chronologically.
+//
+// If not set, the order of events sent through receiverChan is not guaranteed.
+//
+// Typically, the ebpf program will use bpf_ktime_get_ns() to get a timestamp
+// and store it in the perf event. The perf event struct is opaque to this
+// package, hence the need for a callback.
+func (pm *PerfMap) SetTimestampFunc(timestamp func(*[]byte) uint64) {
+	pm.timestamp = timestamp
+}
+
 func (pm *PerfMap) PollStart() {
-	var incoming BytesWithTimestamp
+	incoming := OrderedBytesArray{timestamp: pm.timestamp}
 
 	m, ok := pm.program.maps[pm.name]
 	if !ok {
@@ -144,8 +164,14 @@ func (pm *PerfMap) PollStart() {
 	go func() {
 		cpuCount := len(m.pmuFDs)
 		pageSize := os.Getpagesize()
-		pageCount := 8
 		state := C.struct_read_state{}
+
+		defer func() {
+			close(pm.receiverChan)
+			if pm.lostChan != nil {
+				close(pm.lostChan)
+			}
+		}()
 
 		for {
 			select {
@@ -155,63 +181,86 @@ func (pm *PerfMap) PollStart() {
 				perfEventPoll(m.pmuFDs)
 			}
 
+		harvestLoop:
 			for {
+				select {
+				case <-pm.pollStop:
+					return
+				default:
+				}
+
 				var harvestCount C.int
 				beforeHarvest := nowNanoseconds()
 				for cpu := 0; cpu < cpuCount; cpu++ {
+				ringBufferLoop:
 					for {
 						var sample *PerfEventSample
 						var lost *PerfEventLost
 
-						ok := C.perf_event_read(C.int(pageCount), C.int(pageSize),
+						ok := C.perf_event_read(C.int(pm.pageCount), C.int(pageSize),
 							unsafe.Pointer(&state), unsafe.Pointer(m.headers[cpu]),
 							unsafe.Pointer(&sample), unsafe.Pointer(&lost))
 
 						switch ok {
 						case 0:
-							break // nothing to read
+							break ringBufferLoop // nothing to read
 						case C.PERF_RECORD_SAMPLE:
 							size := sample.Size - 4
 							b := C.GoBytes(unsafe.Pointer(&sample.data), C.int(size))
-							incoming = append(incoming, b)
+							incoming.bytesArray = append(incoming.bytesArray, b)
 							harvestCount++
-							if *(*uint64)(unsafe.Pointer(&b[0])) > beforeHarvest {
+							if pm.timestamp == nil {
+								continue ringBufferLoop
+							}
+							if incoming.timestamp(&b) > beforeHarvest {
 								// see comment below
-								break
-							} else {
-								continue
+								break ringBufferLoop
 							}
 						case C.PERF_RECORD_LOST:
+							if pm.lostChan != nil {
+								select {
+								case pm.lostChan <- lost.Lost:
+								case <-pm.pollStop:
+									return
+								}
+							}
 						default:
-							// TODO: handle lost/unknown events?
+							// ignore unknown events
 						}
-						break
 					}
-
 				}
 
-				sort.Sort(incoming)
-				for i := 0; i < len(incoming); i++ {
-					if *(*uint64)(unsafe.Pointer(&incoming[0][0])) > beforeHarvest {
+				if incoming.timestamp != nil {
+					sort.Sort(incoming)
+				}
+				for incoming.Len() > 0 {
+					if incoming.timestamp != nil && incoming.timestamp(&incoming.bytesArray[0]) > beforeHarvest {
 						// This record has been sent after the beginning of the harvest. Stop
 						// processing here to keep the order. "incoming" is sorted, so the next
 						// elements also must not be processed now.
-						break
+						break harvestLoop
 					}
-					pm.receiverChan <- incoming[0]
+					select {
+					case pm.receiverChan <- incoming.bytesArray[0]:
+					case <-pm.pollStop:
+						return
+					}
 					// remove first element
-					incoming = incoming[1:]
+					incoming.bytesArray = incoming.bytesArray[1:]
 				}
-				if harvestCount == 0 && len(incoming) == 0 {
-					break
+				if harvestCount == 0 && len(incoming.bytesArray) == 0 {
+					break harvestLoop
 				}
 			}
 		}
 	}()
 }
 
+// PollStop stops the goroutine that polls the perf event map.
+// Callers must not close receiverChan or lostChan: they will be automatically
+// closed on the sender side.
 func (pm *PerfMap) PollStop() {
-	pm.pollStop <- true
+	close(pm.pollStop)
 }
 
 func perfEventPoll(fds []C.int) error {
@@ -234,12 +283,21 @@ func perfEventPoll(fds []C.int) error {
 }
 
 // Assume the timestamp is at the beginning of the user struct
-type BytesWithTimestamp [][]byte
+type OrderedBytesArray struct {
+	bytesArray [][]byte
+	timestamp  func(*[]byte) uint64
+}
 
-func (a BytesWithTimestamp) Len() int      { return len(a) }
-func (a BytesWithTimestamp) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
-func (a BytesWithTimestamp) Less(i, j int) bool {
-	return *(*C.uint64_t)(unsafe.Pointer(&a[i][0])) < *(*C.uint64_t)(unsafe.Pointer(&a[j][0]))
+func (a OrderedBytesArray) Len() int {
+	return len(a.bytesArray)
+}
+
+func (a OrderedBytesArray) Swap(i, j int) {
+	a.bytesArray[i], a.bytesArray[j] = a.bytesArray[j], a.bytesArray[i]
+}
+
+func (a OrderedBytesArray) Less(i, j int) bool {
+	return a.timestamp(&a.bytesArray[i]) < a.timestamp(&a.bytesArray[j])
 }
 
 // Matching 'struct perf_event_header in <linux/perf_event.h>
